@@ -44,6 +44,15 @@ class Air:
     rho: float = 1.2      # density      [kg/m^3]
 
 
+P_REF = 20e-6             # SPL reference pressure [Pa]
+
+
+def source_gain(spl_1m):
+    """Monopole gain so the free-field PEAK pressure at 1 m corresponds to the
+    given SPL (dB re 20 uPa). |G| = 1/(4 pi r) -> multiply by 4 pi."""
+    return 4.0 * np.pi * np.sqrt(2.0) * P_REF * 10.0 ** (spl_1m / 20.0)
+
+
 # Octave-band absorption coefficients alpha at BANDS Hz (standard building-
 # acoustics tables, e.g. Vorlander "Auralization", Long "Architectural
 # Acoustics"; 63 Hz extrapolated where sources only start at 125 Hz).
@@ -314,10 +323,12 @@ DEFAULT_MATS = ('brick', 'wood floor', 'gypsum drywall')   # walls, floor, ceili
 
 def run(L=(6.0, 5.0, 3.0), x0=(2.0, 2.0, 1.5), f0=80.0, materials=None,
         beta=None, signal='ricker', receivers=((4.5, 3.5, 1.2),),
-        src_amps=None, n_wall=900, off_fac=4.0, Nt=224, dt=0.003, zslice=None,
-        ng=(48, 40), med=None, geometry=None, walls=False, spl=False,
-        progress=None, verbose=True):
-    """Simulate one or more monopole sources in a room.
+        src_amps=None, spl_1m=85.0, n_wall=900, off_fac=4.0, Nt=224, dt=0.003,
+        zslice=None, ng=(48, 40), med=None, geometry=None, walls=False,
+        spl=False, progress=None, verbose=True):
+    """Simulate one or more monopole sources in a room. All returned pressures
+    are in pascals, calibrated so the speaker's free-field peak at 1 m equals
+    spl_1m dB SPL (85 dB ~ a loud speaker).
 
     x0         source position (3,) or several sources (n,3)
     src_amps   per-source amplitudes (e.g. (1,-1) = anti-phase stereo pair)
@@ -352,7 +363,7 @@ def run(L=(6.0, 5.0, 3.0), x0=(2.0, 2.0, 1.5), f0=80.0, materials=None,
     f_cap = med.c / (6.0 * spacing)
     t = np.arange(Nt) * dt
     sig, t0 = source_signal(signal, t, f0)
-    Rf = np.fft.rfft(sig)
+    Rf = np.fft.rfft(sig) * source_gain(spl_1m)      # -> pressures in pascals
     freqs = np.fft.rfftfreq(Nt, dt)
     Rmax = np.abs(Rf).max()
 
@@ -421,6 +432,9 @@ def run(L=(6.0, 5.0, 3.0), x0=(2.0, 2.0, 1.5), f0=80.0, materials=None,
     frf_H = [float(np.abs(Pf[kk, -len(rx)]) / np.abs(Rf[kk])) for kk in active]
 
     metrics = metrics_from_ir(rx_p[:, 0], dt)
+    pk = np.abs(rx_p[:, 0]).max()
+    if pk > 0:
+        metrics['spl_peak'] = float(20 * np.log10(pk / P_REF))
     if geometry is None:
         sab, eyr, abar = statistical_rt60(L, face_mats, max(f0, 63.0))
         metrics.update(rt60_sabine=sab, rt60_eyring=eyr, mean_alpha=abar,
@@ -443,6 +457,101 @@ def run(L=(6.0, 5.0, 3.0), x0=(2.0, 2.0, 1.5), f0=80.0, materials=None,
                 sig=sig, metrics=metrics, modes=modes, L=L, x0=x0, f0=f0,
                 signal=signal, face_mats=face_mats, resmax=resmax,
                 f_cap=f_cap, nsolved=nsolved, dt=dt)
+
+
+def run_steady(L=(6.0, 5.0, 3.0), x0=(2.0, 2.0, 1.5), f0=80.0, materials=None,
+               beta=None, receivers=((4.5, 3.5, 1.2),), src_amps=None,
+               spl_1m=85.0, n_wall=900, off_fac=4.0, zslice=None, ng=(48, 40),
+               med=None, geometry=None, walls=False, progress=None,
+               verbose=True):
+    """Steady-state speaker: solve ONE Helmholtz problem at f0 and return the
+    complex pressure phasor P (Pa). The time field is Re[P e^{i w t}] — a
+    speaker continuously playing a tone; nodes/antinodes are the standing-wave
+    pattern of the room. Fast: a single frequency solve."""
+    med = med or Air()
+    x0, src_amps = _srcs(x0, src_amps)
+    mw, mf, mc = materials or DEFAULT_MATS
+    face_mats = [mw, mw, mw, mw, mf, mc]
+    if geometry is None:
+        wall, nrm, spacing, fid = box_room(L, n_wall)
+        chk, chkn, _, chk_fid = box_room(L, max(60, n_wall // 4))
+    else:
+        wall, nrm, spacing = geometry
+        fid = np.zeros(len(wall), int)
+        face_mats = [mw] * 6
+        chk, chkn, chk_fid = wall[::4], nrm[::4], fid[::4]
+    src = wall + off_fac * spacing * nrm
+    f_cap = med.c / (6.0 * spacing)
+    if f0 > f_cap:
+        raise ValueError(f"tone {f0:.0f} Hz exceeds the resolvable band "
+                         f"{f_cap:.0f} Hz at this quality — raise quality or "
+                         "lower f0")
+
+    if beta is not None:
+        bv = lambda ids: np.full(len(ids), float(beta))
+    else:
+        bf = np.array([beta_of(m, f0) for m in face_mats])
+        bv = lambda ids: bf[ids]
+
+    zs = x0[0, 2] if zslice is None else float(zslice)
+    gx = np.linspace(0.02 * L[0], 0.98 * L[0], ng[0])
+    gy = np.linspace(0.02 * L[1], 0.98 * L[1], ng[1])
+    GX, GY = np.meshgrid(gx, gy)
+    Gpts = np.stack([GX.ravel(), GY.ravel(), np.full(GX.size, zs)], 1)
+    wall_defs, wall_meshes = [], []
+    if walls and geometry is None:
+        dens = ng[0] / (0.96 * L[0])
+        for name, ax_u, ax_v, ax_f, val in (
+                ('floor z=0', 0, 1, 2, 0.0),
+                ('wall x=0', 1, 2, 0, 0.0),
+                ('wall y=0', 0, 2, 1, 0.0)):
+            nu = max(8, int(round(dens * L[ax_u])))
+            nv = max(8, int(round(dens * L[ax_v])))
+            us = np.linspace(0.02 * L[ax_u], 0.98 * L[ax_u], nu)
+            vs = np.linspace(0.02 * L[ax_v], 0.98 * L[ax_v], nv)
+            U, V = np.meshgrid(us, vs)
+            P = np.zeros((U.size, 3))
+            P[:, ax_u], P[:, ax_v], P[:, ax_f] = U.ravel(), V.ravel(), val
+            M = [None, None, None]
+            M[ax_u], M[ax_v], M[ax_f] = U, V, np.full_like(U, val)
+            wall_defs.append((name, P))
+            wall_meshes.append((name, M[0], M[1], M[2]))
+    rx = np.atleast_2d(np.asarray(receivers, float))
+    splits = np.cumsum([len(Gpts)] + [len(P) for _, P in wall_defs] + [len(rx)])[:-1]
+    allpts = np.vstack([Gpts] + [P for _, P in wall_defs] + [rx])
+
+    om = 2 * np.pi * f0
+    tw = time.time()
+    fsol = solve_freq(om, med, wall, nrm, src, x0, bv(fid), src_amps)
+    resmax = bc_residual(om, med, chk, chkn, src, x0, bv(chk_fid), fsol, src_amps)
+    amp = source_gain(spl_1m)
+    P_all = eval_field(allpts, src, fsol, x0, om, med, amp, src_amps)
+    if progress:
+        progress(1, 1)
+    parts = np.split(P_all, splits)
+    P = parts[0].reshape(ng[1], ng[0])
+    wall_fields = [dict(name=nm, X=X, Y=Y, Z=Z, P=p.reshape(X.shape))
+                   for (nm, X, Y, Z), p in zip(wall_meshes, parts[1:-1])]
+    P_rx = parts[-1]
+
+    metrics = {'spl_mic': float(20 * np.log10(np.abs(P_rx[0]) / np.sqrt(2)
+                                              / P_REF))}
+    if geometry is None:
+        sab, eyr, abar = statistical_rt60(L, face_mats, f0)
+        V = L[0] * L[1] * L[2]
+        metrics.update(rt60_sabine=sab, rt60_eyring=eyr, mean_alpha=abar,
+                       volume=V, area=float(face_areas(L).sum()),
+                       f_schroeder=float(2000 * np.sqrt(sab / V)))
+        modes = room_modes(L, med.c, fmax=min(f_cap, 200.0))
+    else:
+        modes = []
+    if verbose:
+        print(f"[steady] f={f0:.1f} Hz, {len(wall)} wall pts in "
+              f"{time.time() - tw:.1f}s, BC residual ~{resmax:.1e}, "
+              f"SPL@mic {metrics['spl_mic']:.1f} dB")
+    return dict(steady=True, P=P, walls=wall_fields, P_rx=P_rx, X=GX, Y=GY,
+                z=zs, L=L, x0=x0, f0=f0, metrics=metrics, modes=modes,
+                face_mats=face_mats, resmax=resmax, f_cap=f_cap)
 
 
 # ============================================================================

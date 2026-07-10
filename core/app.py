@@ -76,28 +76,36 @@ def simulate(params):
     zs = str(params.get('zs', '')).strip()
     show_walls = params.get('view', 'walls') == 'walls' and geometry is None
     scale = params.get('scale', 'pressure')
+    spl_1m = min(max(_f(params, 'spl1m', 85.0), 40.0), 120.0)
+    signal = params.get('signal', 'ricker')
 
     def _prog(done, total):
         JOB['done'], JOB['total'] = done, total
 
-    res = ac.run(L=tuple(L), x0=np.array(sources), src_amps=amps,
-                 f0=_f(params, 'f0', 80.0), materials=mats,
-                 signal=params.get('signal', 'ricker'), receivers=(tuple(rx),),
-                 n_wall=n_wall, Nt=Nt, dt=dt, ng=ng,
-                 zslice=float(zs) if zs else None, geometry=geometry,
-                 walls=show_walls, spl=(scale == 'spl'),
-                 progress=_prog, verbose=True)
+    common = dict(L=tuple(L), x0=np.array(sources), src_amps=amps,
+                  f0=_f(params, 'f0', 80.0), materials=mats, spl_1m=spl_1m,
+                  receivers=(tuple(rx),), n_wall=n_wall, ng=ng,
+                  zslice=float(zs) if zs else None, geometry=geometry,
+                  walls=show_walls, progress=_prog, verbose=True)
+    if signal == 'tone':
+        return _steady_response(ac.run_steady(**common), rx, scale)
+
+    res = ac.run(signal=signal, Nt=Nt, dt=dt, spl=(scale == 'spl'), **common)
 
     t = res['t']
     stride = max(1, int(np.ceil(len(t) / 95)))       # <= ~95 animation frames
     idx = list(range(0, len(t), stride))
     rnd = lambda a: np.round(np.asarray(a, float), 4).tolist()
 
+    db_hi = db_lo = 0.0
     if scale == 'spl':
         fields = [res['env']] + (res['env_walls'] or [])
-        ref = max(f.max() for f in fields)
+        # absolute SPL of the instantaneous envelope: 20 log10(env/sqrt(2)/p_ref)
+        ref = np.sqrt(2.0) * ac.P_REF
+        db_hi = float(np.ceil(20 * np.log10(max(f.max() for f in fields) / ref)))
+        db_lo = db_hi - 50.0
         todb = lambda a: np.round(np.clip(20 * np.log10(
-            np.maximum(a, 1e-12) / ref), -40, 0), 2).tolist()
+            np.maximum(a, 1e-12) / ref), db_lo, db_hi), 2).tolist()
         frames = [todb(res['env'][i]) for i in idx]
         wall_frames = [[todb(e[i]) for i in idx] for e in (res['env_walls'] or [])]
         vmax = 0.0
@@ -112,13 +120,14 @@ def simulate(params):
     return {
         'x': rnd(res['X'][0]), 'y': rnd(res['Y'][:, 0]), 'z': float(res['z']),
         'L': L, 'sources': rnd(res['x0']), 'rxp': rnd(rx),
-        'vmax': vmax, 'scale': scale,
+        'vmax': vmax, 'scale': scale, 'db_hi': db_hi, 'db_lo': db_lo,
         't_ms': rnd(np.asarray(t)[idx] * 1000),
         'frames': frames,
         'walls': [{'name': w['name'], 'X': rnd(w['X']), 'Y': rnd(w['Y']),
                    'Z': rnd(w['Z']), 'frames': wf}
                   for w, wf in zip(res['walls'] or [], wall_frames)],
-        'ir': {'t_ms': rnd(t * 1000), 'h': rnd(res['rx_p'][:, 0] * 1000),
+        'ir': {'t_ms': rnd(t * 1000),
+               'h': np.round(res['rx_p'][:, 0], 6).tolist(),   # pascals
                'sig': rnd(res['sig']), 'dt': res['dt'],
                'schroeder': m.get('schroeder_db', [])},
         'frf': {'f': rnd(res['frf_f']),
@@ -127,10 +136,40 @@ def simulate(params):
         'metrics': {k: m.get(k) for k in
                     ('rt60_t20', 'rt60_sabine', 'rt60_eyring', 'edt', 'c50',
                      'c80', 'd50', 'mean_alpha', 'volume', 'area',
-                     'f_schroeder', 'bands')},
+                     'f_schroeder', 'bands', 'spl_peak')},
         'modes': res['modes'][:25],
         'meta': {'bc_residual': res['resmax'], 'nsolved': res['nsolved'],
                  'f_cap': res['f_cap'], 'f0': res['f0'], 'signal': res['signal'],
+                 'materials': [res['face_mats'][0], res['face_mats'][4],
+                               res['face_mats'][5]]},
+    }
+
+
+def _steady_response(res, rx, scale):
+    """Response for the continuous speaker tone: send the complex phasor
+    (Re, Im) — the client animates p(t) = Re cos(wt) - Im sin(wt) locally,
+    so the animation loops seamlessly with a tiny payload."""
+    rnd = lambda a: np.round(np.asarray(a, float), 5).tolist()
+    P = res['P']
+    fields = [P] + [w['P'] for w in res['walls']]
+    # 94th percentile: the 1/r near-field around the speaker must not wash out
+    # the room's standing-wave contrast
+    vmax = float(max(np.percentile(np.abs(f), 94) for f in fields))
+    m = dict(res['metrics'])
+    return {
+        'steady': True, 'f0': res['f0'], 'period_ms': 1000.0 / res['f0'],
+        'x': rnd(res['X'][0]), 'y': rnd(res['Y'][:, 0]), 'z': float(res['z']),
+        'L': list(res['L']), 'sources': rnd(res['x0']), 'rxp': rnd(rx),
+        'vmax': vmax, 'scale': scale,
+        're': rnd(P.real), 'im': rnd(P.imag),
+        'walls': [{'name': w['name'], 'X': rnd(w['X']), 'Y': rnd(w['Y']),
+                   'Z': rnd(w['Z']), 're': rnd(w['P'].real),
+                   'im': rnd(w['P'].imag)} for w in res['walls']],
+        'ir': {'rx_re': float(res['P_rx'][0].real),
+               'rx_im': float(res['P_rx'][0].imag)},
+        'metrics': m, 'modes': res['modes'][:25],
+        'meta': {'bc_residual': res['resmax'], 'nsolved': 1,
+                 'f_cap': res['f_cap'], 'f0': res['f0'], 'signal': 'tone',
                  'materials': [res['face_mats'][0], res['face_mats'][4],
                                res['face_mats'][5]]},
     }
@@ -221,10 +260,15 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <div><label>y</label><input id="sy" value="2"></div>
   <div><label>z</label><input id="sz" value="1.5"></div></div>
  <div class="row"><div><label>Signal</label>
-  <select id="signal"><option value="ricker">Ricker pulse</option>
+  <select id="signal"><option value="tone">Speaker tone (steady)</option>
+   <option value="ricker">Ricker pulse</option>
    <option value="toneburst">Tone burst</option><option value="click">Click</option>
    <option value="chirp">Chirp sweep</option></select></div>
   <div><label>f0 (Hz)</label><input id="f0" value="80"></div></div>
+ <label>Speaker level @ 1 m (dB SPL)</label>
+ <input type="range" id="spl1m" min="50" max="110" step="1" value="85"
+  oninput="spl1mV.textContent=this.value"><div style="text-align:center;color:var(--mut)">
+  <span id="spl1mV">85</span> dB</div>
  <div class="chk"><input type="checkbox" id="s2on" onchange="s2f.style.display=this.checked?'block':'none'">
   <label style="margin:0">Second source (stereo pair)</label></div>
  <div id="s2f" style="display:none">
@@ -337,7 +381,7 @@ async function runSim(){
   btn.disabled=true;st.textContent='Starting solver\\u2026';
   $('pbarw').style.display='block';$('pbar').style.width='0%';
   const ids=['Lx','Ly','Lz','sx','sy','sz','s2x','s2y','s2z','s2pol','rx','ry','rz',
-             'f0','signal','quality','obj','view','scale','zs',
+             'f0','signal','quality','obj','view','scale','zs','spl1m',
              'mat_walls','mat_floor','mat_ceiling'];
   const p={};ids.forEach(i=>p[i]=$(i).value);
   p.s2on=$('s2on').checked?'1':'0';
@@ -361,7 +405,8 @@ async function runSim(){
       `${D.meta.nsolved} frequencies, band \\u2264 ${D.meta.f_cap.toFixed(0)} Hz\\n`+
       `BC residual ${D.meta.bc_residual.toExponential(1)}`;
     $('empty').style.display='none';$('ctrl3d').style.display='flex';
-    render3D();renderIR();renderSpec();renderFRF();renderMetrics();
+    if(D.steady){renderSteady3D();renderSteadyIR();renderFRF();renderMetrics();}
+    else{render3D();renderIR();renderSpec();renderFRF();renderMetrics();}
   }catch(e){st.textContent='Error: '+e.message;}
   $('pbarw').style.display='none';btn.disabled=false;
 }
@@ -377,14 +422,14 @@ function wire(L){
          hoverinfo:'skip',showlegend:false};
 }
 function render3D(){
-  const spl=D.scale==='spl',v=spl?40:D.vmax,relief=parseFloat($('relief').value)*D.L[2];
+  const spl=D.scale==='spl',v=spl?1:D.vmax,relief=parseFloat($('relief').value)*D.L[2];
   const cmap=$('cmap').value;
-  const amp=p=>spl?Math.pow(10,p/20):p/v;
+  const amp=p=>spl?(p-D.db_lo)/(D.db_hi-D.db_lo):p/v;
   const zOf=f=>f.map(r=>r.map(p=>D.z+amp(p)*relief));
-  const cargs=spl?{cmin:-40,cmax:0,colorscale:cmap==='RdBu'?'Inferno':cmap}
+  const cargs=spl?{cmin:D.db_lo,cmax:D.db_hi,colorscale:cmap==='RdBu'?'Inferno':cmap}
                  :{cmin:-v,cmax:v,colorscale:cmap,reversescale:cmap==='RdBu'};
   const surf=i=>Object.assign({type:'surface',x:D.x,y:D.y,z:zOf(D.frames[i]),
-    surfacecolor:D.frames[i],colorbar:{title:spl?'dB':'p',len:0.55}},cargs);
+    surfacecolor:D.frames[i],colorbar:{title:spl?'dB SPL':'Pa',len:0.55}},cargs);
   const wsurf=(w,i)=>Object.assign({type:'surface',x:w.X,y:w.Y,z:w.Z,
     surfacecolor:w.frames[i],showscale:false,name:w.name},cargs);
   const walls=D.walls||[];
@@ -415,6 +460,91 @@ function render3D(){
       font:{size:12}},steps:steps}]
   },{responsive:true}).then(gd=>Plotly.addFrames(gd,frames));
 }
+function renderSteady3D(){
+  // continuous speaker: p(t) = Re cos(wt) - Im sin(wt); loops seamlessly.
+  const spl=D.scale==='spl',relief=parseFloat($('relief').value)*D.L[2];
+  const cmap=$('cmap').value,v=D.vmax;
+  const pref=Math.sqrt(2)*2e-5;
+  const nph=24,ncyc=3;
+  const phase=(re,im,c,s)=>re.map((row,i)=>row.map((x,j)=>x*c-im[i][j]*s));
+  const toSPL=(re,im)=>re.map((row,i)=>row.map((x,j)=>
+    20*Math.log10(Math.max(Math.hypot(x,im[i][j])/pref,1e-3))));
+  if(spl){    // steady SPL map is time-invariant: show the standing-wave map
+    const Zs=toSPL(D.re,D.im);let hi=-1e9;Zs.forEach(r=>r.forEach(x=>hi=Math.max(hi,x)));
+    hi=Math.ceil(hi);const lo=hi-40;
+    const cargs={cmin:lo,cmax:hi,colorscale:cmap==='RdBu'?'Inferno':cmap};
+    const mk=(x,y,z,sc,scale)=>Object.assign({type:'surface',x:x,y:y,z:z,
+      surfacecolor:sc,showscale:scale,colorbar:scale?{title:'dB SPL',len:0.55}:undefined},cargs);
+    const tr=[mk(D.x,D.y,D.re.map(r=>r.map(_=>D.z)),Zs,true)];
+    (D.walls||[]).forEach(w=>tr.push(mk(w.X,w.Y,w.Z,toSPL(w.re,w.im),false)));
+    Plotly.newPlot('plot3d',tr.concat([wire(D.L),steadyMarkers().spk,steadyMarkers().mic]),
+      steadyLayout(`Standing-wave SPL map \\u00B7 ${D.f0.toFixed(0)} Hz tone (time-invariant)`),
+      {responsive:true});
+    return;
+  }
+  const cargs={cmin:-v,cmax:v,colorscale:cmap,reversescale:cmap==='RdBu'};
+  const frameField=k=>{const ph=2*Math.PI*k/nph;
+    return phase(D.re,D.im,Math.cos(ph),Math.sin(ph));};
+  const surfAt=(f,first)=>Object.assign({type:'surface',x:D.x,y:D.y,
+    z:f.map(r=>r.map(p=>D.z+p/v*relief)),surfacecolor:f,
+    showscale:first,colorbar:first?{title:'Pa',len:0.55}:undefined},cargs);
+  const wallAt=(w,k)=>{const ph=2*Math.PI*k/nph;
+    const f=phase(w.re,w.im,Math.cos(ph),Math.sin(ph));
+    return Object.assign({type:'surface',x:w.X,y:w.Y,z:w.Z,surfacecolor:f,
+      showscale:false},cargs);};
+  const animated=k=>[surfAt(frameField(k),true)].concat((D.walls||[]).map(w=>wallAt(w,k)));
+  const N=nph*ncyc;
+  const frames=[];for(let k=0;k<N;k++)frames.push({name:''+k,data:animated(k)});
+  const steps=[];for(let k=0;k<N;k++)steps.push({method:'animate',
+    label:(k%nph*D.period_ms/nph).toFixed(1),
+    args:[[''+k],{mode:'immediate',frame:{duration:0,redraw:true},transition:{duration:0}}]});
+  const m=steadyMarkers();
+  Plotly.newPlot('plot3d',animated(0).concat([wire(D.L),m.spk,m.mic]),
+    Object.assign(steadyLayout(''),{
+    updatemenus:[{type:'buttons',x:0.04,y:0.04,bgcolor:'#1d2330',font:{color:'#d6dae2'},
+      buttons:[{label:'\\u25B6 Play',method:'animate',
+        args:[null,{frame:{duration:Math.max(+$('speed').value/2,20),redraw:true},
+        fromcurrent:true,transition:{duration:0}}]},
+      {label:'\\u275A\\u275A',method:'animate',
+       args:[[null],{mode:'immediate',frame:{duration:0,redraw:false}}]}]}],
+    sliders:[{x:0.17,len:0.79,y:0.03,currentvalue:{prefix:'phase t = ',suffix:' ms',
+      font:{size:12}},steps:steps}]}),
+    {responsive:true}).then(gd=>Plotly.addFrames(gd,frames));
+}
+function steadyMarkers(){
+  return{spk:{type:'scatter3d',x:D.sources.map(s=>s[0]),y:D.sources.map(s=>s[1]),
+    z:D.sources.map(s=>s[2]),mode:'markers+text',
+    marker:{size:7,color:'#facc15',symbol:'diamond'},
+    text:D.sources.map((s,i)=>'S'+(i+1)),textposition:'top center',
+    textfont:{color:'#facc15'},showlegend:false},
+  mic:{type:'scatter3d',x:[D.rxp[0]],y:[D.rxp[1]],z:[D.rxp[2]],mode:'markers+text',
+    marker:{size:6,color:'#22d3ee'},text:['R'],textposition:'top center',
+    textfont:{color:'#22d3ee'},showlegend:false}};
+}
+function steadyLayout(title){
+  return{template:'plotly_dark',paper_bgcolor:'#0d0f14',
+    title:title?{text:title,font:{size:13}}:undefined,
+    scene:{aspectmode:'data',xaxis:{title:'x (m)'},yaxis:{title:'y (m)'},
+      zaxis:{title:'z (m)'},camera:{eye:{x:1.45,y:1.45,z:0.85}},bgcolor:'#0d0f14'},
+    margin:{l:0,r:0,t:title?30:8,b:0}};
+}
+function renderSteadyIR(){
+  const A=Math.hypot(D.ir.rx_re,D.ir.rx_im),ph0=Math.atan2(D.ir.rx_im,D.ir.rx_re);
+  const T=D.period_ms,n=200,ts=[],ps=[];
+  for(let i=0;i<n;i++){const t=3*T*i/n;ts.push(t);
+    ps.push(A*Math.cos(2*Math.PI*t/T+ph0));}
+  Plotly.newPlot('plotir',[{x:ts,y:ps,mode:'lines',name:'p at mic',
+    line:{color:'#22d3ee',width:2}}],
+   {template:'plotly_dark',paper_bgcolor:'#0d0f14',plot_bgcolor:'#0d0f14',
+    title:{text:`Steady tone at receiver \\u00B7 amplitude ${A.toFixed(3)} Pa \\u00B7 `+
+      `${D.metrics.spl_mic.toFixed(1)} dB SPL`,font:{size:13}},
+    xaxis:{title:'time (ms)'},yaxis:{title:'p (Pa)'},margin:{t:40,b:36}},{responsive:true});
+  Plotly.newPlot('plotspec',[],{template:'plotly_dark',paper_bgcolor:'#0d0f14',
+    plot_bgcolor:'#0d0f14',xaxis:{visible:false},yaxis:{visible:false},
+    annotations:[{text:'Spectrogram & auralization need a broadband signal '+
+      '(Ricker / click / chirp)',showarrow:false,font:{color:'#8b93a3',size:13}}]},
+    {responsive:true});
+}
 function renderIR(){
   const ir=D.ir;
   const tr=[{x:ir.t_ms,y:ir.h,name:'pressure at mic',line:{color:'#22d3ee',width:1.5}},
@@ -425,7 +555,7 @@ function renderIR(){
              line:{color:'#f472b6',width:2}});
   Plotly.newPlot('plotir',tr,{template:'plotly_dark',paper_bgcolor:'#0d0f14',
     plot_bgcolor:'#0d0f14',title:{text:'Room response at receiver',font:{size:13}},
-    xaxis:{title:'time (ms)'},yaxis:{title:'p (arb.)'},
+    xaxis:{title:'time (ms)'},yaxis:{title:'p (Pa)'},
     yaxis2:{title:'decay (dB)',overlaying:'y',side:'right',range:[-60,3],showgrid:false},
     yaxis3:{overlaying:'y',visible:false},
     legend:{x:0.68,y:1.08,orientation:'h'},margin:{t:40,b:36}},{responsive:true});
@@ -461,6 +591,13 @@ function smooth3rd(f,HdB){                    // 1/3-octave smoothing
 }
 function renderFRF(){
   if(!D)return;
+  if(D.steady){
+    Plotly.newPlot('plotfrf',[],{template:'plotly_dark',paper_bgcolor:'#0d0f14',
+      plot_bgcolor:'#0d0f14',xaxis:{visible:false},yaxis:{visible:false},
+      annotations:[{text:'The transfer function needs a broadband signal \\u2014 '+
+        'switch Signal to Ricker / click / chirp',showarrow:false,
+        font:{color:'#8b93a3',size:13}}]},{responsive:true});
+    return;}
   const tr=[];
   const y=$('fSmooth').checked?smooth3rd(D.frf.f,D.frf.HdB):D.frf.HdB;
   if($('fPrev').checked&&prevD)
@@ -492,15 +629,19 @@ function renderMetrics(){
   const f=(x,d)=>x==null?'\\u2014':x.toFixed(d);
   const dd=(k)=>(m[k]!=null&&pm&&pm[k]!=null)?m[k]-pm[k]:null;
   let h='<h2 style="margin-top:0">Reverberation &amp; clarity (ISO 3382)</h2><div class="cards">';
+  if(m.spl_mic!=null)h+=card('SPL at mic',f(m.spl_mic,1),'dB \\u00B7 steady tone',dd('spl_mic'));
+  if(m.spl_peak!=null)h+=card('Peak SPL at mic',f(m.spl_peak,1),'dB \\u00B7 pulse peak',dd('spl_peak'));
+  if(!D.steady)
   h+=card('RT60 \\u00B7 T20 (measured)',f(m.rt60_t20,2),'s \\u00B7 Schroeder integration'+
     (m.rt60_t20==null?' \\u00B7 window too short':''),dd('rt60_t20'));
   h+=card('RT60 \\u00B7 Sabine',f(m.rt60_sabine,2),'s \\u00B7 0.161V/A',dd('rt60_sabine'));
   h+=card('RT60 \\u00B7 Eyring',f(m.rt60_eyring,2),'s',dd('rt60_eyring'));
+  if(!D.steady){
   h+=card('EDT',f(m.edt,2),'s \\u00B7 early decay time',dd('edt'));
   h+=card('C50 clarity',f(m.c50,1),'dB \\u00B7 speech',dd('c50'));
   h+=card('C80 clarity',f(m.c80,1),'dB \\u00B7 music',dd('c80'));
   h+=card('D50 definition',m.d50==null?'\\u2014':(100*m.d50).toFixed(0)+'%',
-    'early/total energy',dd('d50')==null?null:100*dd('d50'));
+    'early/total energy',dd('d50')==null?null:100*dd('d50'));}
   h+=card('Schroeder frequency',f(m.f_schroeder,0),'Hz \\u00B7 modal\\u2192statistical',null);
   h+=card('Volume',f(m.volume,1),'m\\u00B3',null);
   h+=card('Mean absorption',f(m.mean_alpha,3),'\\u0101 over '+f(m.area,0)+' m\\u00B2',null);
@@ -539,7 +680,7 @@ function downloadCSV(){if(!D)return;
   dl(new Blob([s],{type:'text/csv'}),'room_metrics.csv');}
 function downloadJSON(){if(!D)return;
   dl(new Blob([JSON.stringify(D)],{type:'application/json'}),'roomwave_result.json');}
-function downloadWAV(){if(!D)return;
+function downloadWAV(){if(!D||D.steady)return;
   const buf=irBuffer(),ch=buf.getChannelData(0),sr=buf.sampleRate,n=ch.length;
   const b=new ArrayBuffer(44+2*n),v=new DataView(b);
   const ws=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
@@ -561,10 +702,10 @@ function irBuffer(){
     ch[i]=((h[j]||0)*(1-fr)+(h[j+1]||0)*fr)/peak*0.8;}
   return buf;}
 function stopAudio(){playing.forEach(s=>{try{s.stop()}catch(e){}});playing=[];}
-function playIR(){if(!D)return;
+function playIR(){if(!D||D.steady)return;
   const buf=irBuffer(),src=actx.createBufferSource();
   src.buffer=buf;src.connect(actx.destination);src.start();playing.push(src);}
-function playThroughRoom(mkSrc){if(!D)return;
+function playThroughRoom(mkSrc){if(!D||D.steady)return;
   const buf=irBuffer(),conv=actx.createConvolver();conv.normalize=true;conv.buffer=buf;
   const s=mkSrc(actx),wet=actx.createGain(),dry=actx.createGain();
   wet.gain.value=parseFloat($('wet').value);dry.gain.value=1-0.7*wet.gain.value;
