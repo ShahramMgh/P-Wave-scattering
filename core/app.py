@@ -211,7 +211,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <div><label>Ly</label><input id="Ly" value="5"></div>
   <div><label>Lz</label><input id="Lz" value="3"></div></div>
  <label>OBJ mesh file (optional, overrides box)</label>
- <input id="obj" placeholder="leave empty for box room">
+ <input id="obj" placeholder="leave empty for box room" autocomplete="off">
  <h2>Surface materials</h2>
  <label>Walls</label><select id="mat_walls">__MATS__</select>
  <label>Floor</label><select id="mat_floor">__MATS__</select>
@@ -304,7 +304,10 @@ const $=id=>document.getElementById(id);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 window.addEventListener('DOMContentLoaded',()=>{   // sensible material defaults
   $('mat_walls').value='brick';$('mat_floor').value='wood floor';
-  $('mat_ceiling').value='gypsum drywall';});
+  $('mat_ceiling').value='gypsum drywall';
+  $('obj').value='';   // Firefox restores form values by POSITION on reload —
+                       // stale text from an older layout must not become a path
+});
 const PRESETS={
  living:{Lx:6,Ly:5,Lz:3,mat_walls:'brick',mat_floor:'wood floor',mat_ceiling:'gypsum drywall',
          sx:1,sy:1,sz:1.2,rx:4.5,ry:3.5,rz:1.2,f0:80,signal:'ricker'},
