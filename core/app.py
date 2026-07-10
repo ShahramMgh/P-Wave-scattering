@@ -1,12 +1,31 @@
 """
 app.py — RoomWave Studio: wave-based 3D room acoustics analyzer (local web app).
 
-Zero-dependency server (stdlib http.server; Flask is broken in this env) +
-Plotly.js UI. Physics: acoustics.py (scalar Helmholtz MFS, per-surface
-frequency-dependent impedance materials, ISO 3382 metrics).
+Zero-dependency server (stdlib http.server + Plotly.js served from the
+installed plotly package; no Flask). Physics: acoustics.py (scalar Helmholtz
+MFS, per-surface frequency-dependent impedance materials, physically
+calibrated speaker source, ISO 3382 metrics).
 
 Run:
     python app.py            # then open http://localhost:8747
+
+HTTP API (one simulation at a time; long solves run in a worker thread so no
+request is ever held open for minutes — browsers drop those):
+
+    GET  /            the single-page UI
+    GET  /plotly.js   plotly.min.js from the local plotly package
+    POST /simulate    start a job; body = JSON of the sidebar fields
+                      -> 202 {"started": true} | 429 if one is running
+    GET  /progress    {"state": idle|running|done|error, "done", "total", "error"}
+    GET  /result      full result JSON of the last finished job (409 if none)
+
+The result payload is documented by its two builders below: simulate()
+(transient signals: field movie + IR + FRF + metrics) and _steady_response()
+(speaker tone: complex phasor field; the client animates Re[P e^{iwt}]
+locally so the loop is seamless and the payload small).
+
+See ../docs/USER_GUIDE.md for the UI walkthrough and ../docs/PHYSICS.md for
+the formulation.
 """
 from __future__ import annotations
 import json

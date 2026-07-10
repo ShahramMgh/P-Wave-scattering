@@ -22,6 +22,22 @@ geometric/ray methods (ODEON, CATT) are invalid and commercial wave solvers
     EDT, C50, C80, D50 + analytic rigid-room mode table & Schroeder frequency
 
 Conventions: time factor e^{+i w t}, outgoing G = e^{-ikr}/(4 pi r).
+All returned pressures are physical pascals: the speaker source is calibrated
+by its free-field level at 1 m (spl_1m, dB SPL re 20 uPa).
+
+Public API
+----------
+run(...)         transient simulation (Ricker/toneburst/click/chirp source):
+                 pressure movie on a slice (+ wall faces), receiver impulse
+                 responses, transfer function, ISO 3382 metrics
+run_steady(...)  single-frequency speaker tone: complex phasor field P(x);
+                 the time field is Re[P e^{iwt}] (standing-wave pattern)
+animate(res)     standalone interactive 3D HTML (no web app required)
+self_test()      the 4 verification checks (run: python acoustics.py --selftest)
+MATERIALS        octave-band absorption database; alpha_of / beta_of
+box_room / load_obj   geometry builders (collocation points + normals)
+
+Full formulation and references: ../docs/PHYSICS.md.
 
 Usage:
     python acoustics.py --selftest        # physics checks (~1 min)
